@@ -627,7 +627,6 @@ class JobPostingScraper(BaseScraper):
     def scrape(self) -> list[SAPSignal]:
         signals = []
         signals.extend(self._scrape_google_jobs())
-        signals.extend(self._scrape_gulftalent())
         logger.info("JobPostingScraper: %d signals", len(signals))
         return signals
 
@@ -663,40 +662,6 @@ class JobPostingScraper(BaseScraper):
                         source_url=link,
                         summary=f"Hiring SAP staff: {title[:100]}",
                     ))
-        return results
-
-    def _scrape_gulftalent(self) -> list[SAPSignal]:
-        results = []
-        for country, location in [("Saudi Arabia", "saudi-arabia"), ("UAE", "uae"), ("Qatar", "qatar")]:
-            url = f"https://www.gulftalent.com/jobs/search?keywords=SAP&location={location}"
-            resp = self.fetch(url)
-            if not resp:
-                continue
-            soup = BeautifulSoup(resp.text, "lxml")
-            for job in soup.select("div.job-listing, article, .search-result, tr.job, [class*='job']")[:12]:
-                title_el = job.select_one("a[class*='title'], h2 a, h3 a, a.job-title")
-                if not title_el:
-                    continue
-                title = title_el.get_text(strip=True)
-                if "sap" not in title.lower():
-                    continue
-                company_el = job.select_one("[class*='company'], .employer, .org")
-                company = company_el.get_text(strip=True) if company_el else ""
-                if not company or is_excluded(company):
-                    continue
-                link = title_el.get("href", "")
-                if link and not link.startswith("http"):
-                    link = f"https://www.gulftalent.com{link}"
-                results.append(SAPSignal(
-                    company=company,
-                    country=country,
-                    sap_products=self._infer_sap_role(title),
-                    signal_type="job_posting",
-                    signal_quality="Medium",
-                    source_name="GulfTalent",
-                    source_url=link,
-                    summary=f"Hiring: {title}",
-                ))
         return results
 
     def _extract_hiring_company(self, title: str, snippet: str) -> str:
