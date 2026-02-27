@@ -327,6 +327,9 @@ class BaseScraper:
         "Upgrade-Insecure-Requests": "1",
     }
 
+    # Domains known to block scrapers — skip directly to Google fallback
+    _blocked_domains: set = set()
+
     def __init__(self, rate_limit: float = 2.0):
         self.session = requests.Session()
         self.ua = UserAgent()
@@ -341,22 +344,80 @@ class BaseScraper:
             time.sleep(self.rate_limit - elapsed)
         self._last_request_time = time.time()
 
+    def _rotate_headers(self):
+        """Rotate User-Agent and add jitter to appear more human."""
+        self.session.headers["User-Agent"] = self.ua.random
+
     def fetch(self, url: str, params: dict = None, max_retries: int = 3) -> Optional[requests.Response]:
         """Fetch URL with retries and rate limiting."""
+        parsed = urlparse(url)
+        domain = parsed.netloc
+
+        # If this domain is already known to block us, skip direct fetch entirely
+        if domain in BaseScraper._blocked_domains:
+            logger.info("Skipping blocked domain %s — using Google fallback", domain)
+            return self._google_cache_fallback(url)
+
         for attempt in range(max_retries):
             try:
                 self._throttle()
-                self.session.headers["User-Agent"] = self.ua.random
-                parsed = urlparse(url)
+                self._rotate_headers()
                 self.session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
                 resp = self.session.get(url, params=params, timeout=20, allow_redirects=True)
                 resp.raise_for_status()
                 return resp
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 403:
+                    logger.warning("403 Forbidden from %s — marking domain as blocked", domain)
+                    BaseScraper._blocked_domains.add(domain)
+                    return self._google_cache_fallback(url)
+                wait = 2 ** (attempt + 1)
+                logger.warning("Attempt %d failed for %s: %s — retry in %ds", attempt + 1, url, e, wait)
+                time.sleep(wait)
             except requests.RequestException as e:
                 wait = 2 ** (attempt + 1)
                 logger.warning("Attempt %d failed for %s: %s — retry in %ds", attempt + 1, url, e, wait)
                 time.sleep(wait)
         logger.error("All retries exhausted for %s", url)
+        return None
+
+    def _google_cache_fallback(self, original_url: str) -> Optional[requests.Response]:
+        """When a site blocks us, try Google's cached version or a Google
+        search scoped to that site as a fallback."""
+        parsed = urlparse(original_url)
+        domain = parsed.netloc
+
+        # Strategy 1: Google cache
+        cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{original_url}"
+        try:
+            self._throttle()
+            self._rotate_headers()
+            self.session.headers["Referer"] = "https://www.google.com/"
+            resp = self.session.get(cache_url, timeout=20, allow_redirects=True)
+            if resp.status_code == 200:
+                logger.info("Google cache hit for %s", original_url)
+                return resp
+        except requests.RequestException:
+            pass
+
+        # Strategy 2: Google search scoped to the domain + original query params
+        query_part = parsed.query or parsed.path
+        # Extract meaningful keywords from the URL
+        keywords = re.findall(r'[a-zA-Z]{3,}', query_part)
+        search_terms = " ".join(keywords[:5]) if keywords else "SAP"
+        search_url = f"https://www.google.com/search?q=site:{domain}+{quote_plus(search_terms)}&num=10"
+        try:
+            self._throttle()
+            self._rotate_headers()
+            self.session.headers["Referer"] = "https://www.google.com/"
+            resp = self.session.get(search_url, timeout=20, allow_redirects=True)
+            if resp.status_code == 200:
+                logger.info("Google site-search fallback succeeded for %s", domain)
+                return resp
+        except requests.RequestException:
+            pass
+
+        logger.warning("All fallback strategies failed for %s", original_url)
         return None
 
     def _detect_products(self, text: str) -> list[str]:
@@ -624,11 +685,67 @@ class JobPostingScraper(BaseScraper):
         ],
     }
 
+    # Direct job boards to try (fallback handles 403 automatically)
+    JOB_BOARDS = {
+        "Saudi Arabia": [
+            ("Bayt.com", "https://www.bayt.com/en/saudi-arabia/jobs/?q=SAP"),
+            ("GulfTalent", "https://www.gulftalent.com/jobs/search?keywords=SAP&location=saudi-arabia"),
+        ],
+        "UAE": [
+            ("Bayt.com", "https://www.bayt.com/en/uae/jobs/?q=SAP"),
+            ("GulfTalent", "https://www.gulftalent.com/jobs/search?keywords=SAP&location=uae"),
+        ],
+        "Qatar": [
+            ("Bayt.com", "https://www.bayt.com/en/qatar/jobs/?q=SAP"),
+            ("GulfTalent", "https://www.gulftalent.com/jobs/search?keywords=SAP&location=qatar"),
+        ],
+    }
+
     def scrape(self) -> list[SAPSignal]:
         signals = []
         signals.extend(self._scrape_google_jobs())
+        signals.extend(self._scrape_job_boards())
         logger.info("JobPostingScraper: %d signals", len(signals))
         return signals
+
+    def _scrape_job_boards(self) -> list[SAPSignal]:
+        """Try direct job boards — if they 403, the fetch fallback kicks in
+        and returns Google site-search results for that domain instead."""
+        results = []
+        for country, boards in self.JOB_BOARDS.items():
+            for board_name, url in boards:
+                resp = self.fetch(url)
+                if not resp:
+                    continue
+                soup = BeautifulSoup(resp.text, "lxml")
+                # Generic selectors that work across job boards and Google fallback results
+                for item in soup.select("div.g, div[data-hveid], li.has-pointer-d, .job-item, [data-job-id], article, [class*='job']")[:12]:
+                    title_el = item.select_one("h3, h2 a, .jb-title a, a[class*='title'], a.job-title")
+                    if not title_el:
+                        continue
+                    title = title_el.get_text(strip=True)
+                    if "sap" not in title.lower():
+                        continue
+                    # Try to get company from job board HTML
+                    company_el = item.select_one("[class*='company'], .jb-company, .employer, .org")
+                    if company_el:
+                        company = company_el.get_text(strip=True)
+                    else:
+                        company = self._extract_hiring_company(title, "")
+                    if not company or is_excluded(company):
+                        continue
+                    link = title_el.get("href", "")
+                    results.append(SAPSignal(
+                        company=company,
+                        country=country,
+                        sap_products=self._infer_sap_role(title),
+                        signal_type="job_posting",
+                        signal_quality="Medium",
+                        source_name=board_name,
+                        source_url=link,
+                        summary=f"Hiring: {title[:100]}",
+                    ))
+        return results
 
     def _scrape_google_jobs(self) -> list[SAPSignal]:
         results = []
