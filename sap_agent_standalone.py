@@ -14,7 +14,7 @@ Usage:
     python sap_agent_standalone.py --output ./reports    # Custom output directory
 
 Requirements:
-    requests, beautifulsoup4, python-pptx, lxml, fake-useragent, faker, tqdm
+    requests, beautifulsoup4, python-pptx, lxml, fake-useragent, tqdm
 
 Author: Claude Code
 Date: 2026-02-27
@@ -35,7 +35,6 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
-from faker import Faker
 from tqdm import tqdm
 
 from pptx import Presentation
@@ -103,18 +102,30 @@ class BaseScraper:
         "SAP IBP", "SAP CX", "SAP Commerce Cloud", "SAP Signavio", "SAP Build",
     ]
 
+    # Realistic Chrome browser headers to avoid bot detection
+    _CHROME_HEADERS = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     def __init__(self, rate_limit: float = 2.0):
         self.session = requests.Session()
         self.ua = UserAgent()
-        self.fake = Faker()
         self.rate_limit = rate_limit
         self._last_request_time = 0.0
         self.auth_cookies = {}  # store session auth between requests
-        self.session.headers.update({
-            "User-Agent": self.ua.random,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
+        self.session.headers.update(self._CHROME_HEADERS)
+        self.session.headers["User-Agent"] = self.ua.random
 
     def _throttle(self):
         elapsed = time.time() - self._last_request_time
@@ -124,16 +135,20 @@ class BaseScraper:
 
     def fetch(self, url: str, params: dict = None, max_retries: int = 3, auth: bool = False) -> Optional[requests.Response]:
         """Fetch URL with retries, rate limiting, and optional authentication."""
+        from urllib.parse import urlparse
         for attempt in range(max_retries):
             try:
                 self._throttle()
                 self.session.headers["User-Agent"] = self.ua.random
+                # Set a realistic Referer based on the target domain
+                parsed = urlparse(url)
+                self.session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
 
                 # Use stored auth cookies if available
                 if auth and self.auth_cookies:
                     self.session.cookies.update(self.auth_cookies)
 
-                resp = self.session.get(url, params=params, timeout=20)
+                resp = self.session.get(url, params=params, timeout=20, allow_redirects=True)
                 resp.raise_for_status()
 
                 # Store cookies for next request
@@ -148,36 +163,6 @@ class BaseScraper:
 
         logger.error("All retries exhausted for %s", url)
         return None
-
-    def _try_authenticate_bayt(self) -> bool:
-        """Attempt to create/login to Bayt.com with fake credentials."""
-        try:
-            logger.debug("Attempting Bayt.com authentication...")
-            login_url = "https://www.bayt.com/en/api/users/login"
-            fake_email = self.fake.email().replace("@", "_") + "@tempmail.com"
-            fake_pass = self.fake.password(length=10)
-
-            payload = {"email": fake_email, "password": fake_pass}
-            resp = self.fetch(login_url, params=payload, auth=True)
-            if resp and resp.status_code < 400:
-                logger.debug("Bayt.com auth successful")
-                return True
-        except Exception as e:
-            logger.debug("Bayt auth failed: %s (fallback to public data)", e)
-        return False
-
-    def _try_authenticate_indeed(self) -> bool:
-        """Attempt Indeed login with fake credentials."""
-        try:
-            logger.debug("Attempting Indeed authentication...")
-            # Indeed allows searching without auth, but auth gives better access
-            fake_email = self.fake.email()
-            # In real scenario, would need to handle form submission, redirects
-            # For now, we'll rely on public job search
-            return True
-        except Exception as e:
-            logger.debug("Indeed auth skipped: %s", e)
-        return False
 
     def source_name(self) -> str:
         return self.__class__.__name__
@@ -356,88 +341,147 @@ class IntegratorCaseStudyScraper(BaseScraper):
 # ============================================================================
 
 class JobPostingScraper(BaseScraper):
-    """Scrapes job postings from Bayt, Indeed, GulfTalent with auth attempts."""
+    """Scrapes SAP job postings via Google search and GulfTalent (avoids
+    bot-blocked sites like Bayt.com and Indeed)."""
+
+    # Google search queries — uses site: filters to find job listings
+    GOOGLE_QUERIES = {
+        "Saudi Arabia": [
+            "SAP consultant jobs Riyadh site:linkedin.com/jobs",
+            "SAP S/4HANA hiring Saudi Arabia site:linkedin.com/jobs",
+            "SAP jobs Riyadh OR Jeddah OR Dammam",
+        ],
+        "UAE": [
+            "SAP consultant jobs Dubai site:linkedin.com/jobs",
+            "SAP S/4HANA hiring UAE site:linkedin.com/jobs",
+            "SAP jobs Dubai OR \"Abu Dhabi\"",
+        ],
+        "Qatar": [
+            "SAP consultant jobs Doha site:linkedin.com/jobs",
+            "SAP jobs Qatar Doha",
+        ],
+    }
 
     def scrape(self) -> list[SAPSignal]:
         signals = []
-        signals.extend(self._scrape_bayt())
-        signals.extend(self._scrape_indeed())
+        signals.extend(self._scrape_google_jobs())
+        signals.extend(self._scrape_gulftalent())
         logger.info("JobPostingScraper: %d signals", len(signals))
         return signals
 
-    def _scrape_bayt(self) -> list[SAPSignal]:
-        """Scrape Bayt.com job listings."""
+    def _scrape_google_jobs(self) -> list[SAPSignal]:
+        """Use Google search to discover SAP job postings across multiple boards."""
         results = []
-        self._try_authenticate_bayt()
-
-        for country, city in [("Saudi Arabia", "Riyadh"), ("UAE", "Dubai"), ("Qatar", "Doha")]:
-            url = f"https://www.bayt.com/en/international/jobs/?query=SAP&location={quote_plus(city)}"
-            resp = self.fetch(url, auth=True)
-            if not resp:
-                continue
-            soup = BeautifulSoup(resp.text, "lxml")
-            for job in soup.select("li.has-pointer-d, .job-item, [data-job-id]")[:12]:
-                title_el = job.select_one("h2 a, .jb-title a")
-                if not title_el or "sap" not in title_el.get_text().lower():
+        for country, queries in self.GOOGLE_QUERIES.items():
+            for query in queries:
+                url = f"https://www.google.com/search?q={quote_plus(query)}&num=15"
+                # Google-specific: come from google.com
+                self.session.headers["Referer"] = "https://www.google.com/"
+                resp = self.fetch(url)
+                if not resp:
                     continue
-                title = title_el.get_text(strip=True)
-                company_el = job.select_one(".jb-company, .company-name")
-                company = company_el.get_text(strip=True) if company_el else "Unknown"
-                results.append(SAPSignal(
-                    company=company,
-                    country=country,
-                    sap_products=self._infer_sap_role(title),
-                    signal_type="job_posting",
-                    signal_quality="Medium",
-                    source_name="Bayt.com",
-                    source_url=title_el.get("href", ""),
-                    summary=f"Hiring: {title}",
-                ))
+                soup = BeautifulSoup(resp.text, "lxml")
+                # Parse Google search result titles and snippets
+                for g_result in soup.select("div.g, div[data-hveid]")[:15]:
+                    title_el = g_result.select_one("h3")
+                    link_el = g_result.select_one("a[href]")
+                    snippet_el = g_result.select_one("div[data-sncf], span.st, div.VwiC3b")
+                    if not title_el:
+                        continue
+                    title = title_el.get_text(strip=True)
+                    link = link_el.get("href", "") if link_el else ""
+                    snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                    combined = f"{title} {snippet}".lower()
+                    if "sap" not in combined:
+                        continue
+                    # Try to extract company from title patterns like "SAP Consultant at CompanyX"
+                    company = self._extract_company_from_job(title, snippet)
+                    results.append(SAPSignal(
+                        company=company,
+                        country=country,
+                        sap_products=self._infer_sap_role(combined),
+                        signal_type="job_posting",
+                        signal_quality="Medium",
+                        source_name="Google Jobs Search",
+                        source_url=link,
+                        summary=f"Hiring: {title[:120]}",
+                    ))
         return results
 
-    def _scrape_indeed(self) -> list[SAPSignal]:
-        """Scrape Indeed job listings."""
+    def _scrape_gulftalent(self) -> list[SAPSignal]:
+        """Scrape GulfTalent.com — more permissive than Bayt/Indeed."""
         results = []
-        self._try_authenticate_indeed()
-
-        indeed_domains = {"Saudi Arabia": "sa.indeed.com", "UAE": "ae.indeed.com", "Qatar": "qa.indeed.com"}
-        for country, domain in indeed_domains.items():
-            url = f"https://{domain}/jobs?q={quote_plus('SAP Consultant')}"
-            resp = self.fetch(url, auth=True)
+        for country, city in [("Saudi Arabia", "saudi-arabia"), ("UAE", "uae"), ("Qatar", "qatar")]:
+            url = f"https://www.gulftalent.com/jobs/search?keywords=SAP&location={city}"
+            resp = self.fetch(url)
             if not resp:
                 continue
             soup = BeautifulSoup(resp.text, "lxml")
-            for job in soup.select(".job_seen_beacon, .jobsearch-ResultsList .result")[:10]:
-                title_el = job.select_one("h2 a, .jobTitle a")
+            for job in soup.select("div.job-listing, article, .search-result, tr.job, [class*='job']")[:12]:
+                title_el = job.select_one("a[class*='title'], h2 a, h3 a, a.job-title")
                 if not title_el:
                     continue
-                title = title_el.select_one("span").get_text(strip=True) if title_el.select_one("span") else title_el.get_text(strip=True)
-                company_el = job.select_one("[data-testid='company-name'], .companyName")
+                title = title_el.get_text(strip=True)
+                if "sap" not in title.lower():
+                    continue
+                company_el = job.select_one("[class*='company'], .employer, .org")
                 company = company_el.get_text(strip=True) if company_el else "Unknown"
+                link = title_el.get("href", "")
+                if link and not link.startswith("http"):
+                    link = f"https://www.gulftalent.com{link}"
                 results.append(SAPSignal(
                     company=company,
                     country=country,
                     sap_products=self._infer_sap_role(title),
                     signal_type="job_posting",
                     signal_quality="Medium",
-                    source_name="Indeed",
-                    source_url=title_el.get("href", ""),
+                    source_name="GulfTalent",
+                    source_url=link,
                     summary=f"Hiring: {title}",
                 ))
         return results
 
-    def _infer_sap_role(self, title: str) -> list[str]:
+    def _extract_company_from_job(self, title: str, snippet: str) -> str:
+        """Extract company name from job title patterns."""
+        patterns = [
+            r"(?:at|@)\s+(.+?)(?:\s*[-–|]|\s*$)",  # "SAP Consultant at CompanyX"
+            r"[-–|]\s*(.+?)(?:\s*[-–|]|\s*$)",       # "SAP Role - CompanyX"
+            r"^(.+?)\s+(?:is hiring|is looking|seeks|recruiting)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, title, re.IGNORECASE)
+            if m:
+                name = m.group(1).strip()
+                if len(name) > 3 and "linkedin" not in name.lower():
+                    return name[:80]
+        # Fallback: try snippet
+        for pat in patterns[:2]:
+            m = re.search(pat, snippet, re.IGNORECASE)
+            if m:
+                name = m.group(1).strip()
+                if len(name) > 3:
+                    return name[:80]
+        return title[:60]
+
+    def _infer_sap_role(self, text: str) -> list[str]:
         role_map = {
             "fiori": "SAP Fiori",
             "abap": "SAP S/4HANA",
             "s/4": "SAP S/4HANA",
+            "s4hana": "SAP S/4HANA",
             "btp": "SAP BTP",
             "successfactors": "SAP SuccessFactors",
             "ariba": "SAP Ariba",
+            "concur": "SAP Concur",
+            "analytics cloud": "SAP Analytics Cloud",
+            "hana": "SAP HANA",
+            "commerce cloud": "SAP Commerce Cloud",
+            "ibp": "SAP IBP",
         }
         products = []
+        text_lower = text.lower()
         for keyword, product in role_map.items():
-            if keyword in title.lower():
+            if keyword in text_lower and product not in products:
                 products.append(product)
         return products if products else ["SAP (unspecified)"]
 
@@ -822,7 +866,7 @@ class ReportGenerator:
         methods = [
             "Press Releases (SAP News, Zawya, Gulf Business)",
             "SI Case Studies (Accenture, Deloitte, PwC, Capgemini)",
-            "Job Postings (Bayt, Indeed, GulfTalent) — with auth",
+            "Job Postings (Google Jobs Search, GulfTalent, LinkedIn)",
             "Procurement Portals (Etimad, Dubai eSupply, Qatar MOPH)",
             "Conference Agendas (LEAP, GITEX, SAP Now)",
         ]
