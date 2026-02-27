@@ -1056,11 +1056,25 @@ class ReportGenerator:
         self._add_high_confidence(prs, companies)
         self._add_methodology(prs)
 
-        filename = f"SAP_Customer_Intelligence_GCC_{date.today().isoformat()}.pptx"
-        filepath = os.path.join(self.output_dir, filename)
-        prs.save(filepath)
-        logger.info("Report saved: %s", filepath)
-        return filepath
+        base_name = f"SAP_Customer_Intelligence_GCC_{date.today().isoformat()}"
+        filepath = os.path.join(self.output_dir, f"{base_name}.pptx")
+
+        # If the file is locked (e.g. open in PowerPoint), auto-increment suffix
+        for attempt in range(10):
+            try:
+                prs.save(filepath)
+                logger.info("Report saved: %s", filepath)
+                return filepath
+            except PermissionError:
+                suffix = f"_v{attempt + 2}"
+                filepath = os.path.join(self.output_dir, f"{base_name}{suffix}.pptx")
+                logger.warning("File locked — trying %s", filepath)
+
+        # Final fallback: should never reach here
+        raise PermissionError(
+            f"Cannot save report — all file names are locked. "
+            f"Please close the .pptx file in PowerPoint and re-run."
+        )
 
     def _add_title_slide(self, prs, companies, raw_count):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
