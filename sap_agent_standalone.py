@@ -667,85 +667,33 @@ class JobPostingScraper(BaseScraper):
     """Discovers SAP end-customers by finding companies hiring for internal
     SAP roles. Filters out system integrators and consulting firms."""
 
-    # Queries designed to find END-CUSTOMERS hiring SAP staff (not consultants)
+    # Google queries to find END-CUSTOMERS hiring SAP staff (not consultants)
+    # Multiple query variants increase coverage when some return no results
     GOOGLE_QUERIES = {
         "Saudi Arabia": [
-            '"SAP S/4HANA" hiring Riyadh -consultant -consulting',
-            '"SAP administrator" OR "SAP manager" Riyadh OR Jeddah OR Dammam',
-            'intitle:"SAP" "we are hiring" Saudi Arabia',
+            '"SAP" hiring Riyadh OR Jeddah OR Dammam -consultant -consulting -accenture -deloitte',
+            '"SAP S/4HANA" OR "SAP HANA" OR "SAP SuccessFactors" job Saudi Arabia',
+            '"SAP administrator" OR "SAP manager" OR "SAP lead" "Saudi Arabia"',
+            'site:linkedin.com/jobs "SAP" "Saudi Arabia"',
         ],
         "UAE": [
-            '"SAP S/4HANA" hiring Dubai -consultant -consulting',
-            '"SAP administrator" OR "SAP manager" Dubai OR "Abu Dhabi"',
-            'intitle:"SAP" "we are hiring" UAE OR Dubai',
+            '"SAP" hiring Dubai OR "Abu Dhabi" -consultant -consulting -accenture -deloitte',
+            '"SAP S/4HANA" OR "SAP HANA" OR "SAP SuccessFactors" job UAE OR Dubai',
+            '"SAP administrator" OR "SAP manager" OR "SAP lead" UAE',
+            'site:linkedin.com/jobs "SAP" "Dubai" OR "Abu Dhabi"',
         ],
         "Qatar": [
-            '"SAP S/4HANA" hiring Doha -consultant -consulting',
-            '"SAP manager" OR "SAP lead" Doha Qatar',
-        ],
-    }
-
-    # Direct job boards to try (fallback handles 403 automatically)
-    JOB_BOARDS = {
-        "Saudi Arabia": [
-            ("Bayt.com", "https://www.bayt.com/en/saudi-arabia/jobs/?q=SAP"),
-            ("GulfTalent", "https://www.gulftalent.com/jobs/search?keywords=SAP&location=saudi-arabia"),
-        ],
-        "UAE": [
-            ("Bayt.com", "https://www.bayt.com/en/uae/jobs/?q=SAP"),
-            ("GulfTalent", "https://www.gulftalent.com/jobs/search?keywords=SAP&location=uae"),
-        ],
-        "Qatar": [
-            ("Bayt.com", "https://www.bayt.com/en/qatar/jobs/?q=SAP"),
-            ("GulfTalent", "https://www.gulftalent.com/jobs/search?keywords=SAP&location=qatar"),
+            '"SAP" hiring Doha -consultant -consulting -accenture -deloitte',
+            '"SAP S/4HANA" OR "SAP SuccessFactors" job Qatar',
+            'site:linkedin.com/jobs "SAP" "Qatar" OR "Doha"',
         ],
     }
 
     def scrape(self) -> list[SAPSignal]:
         signals = []
         signals.extend(self._scrape_google_jobs())
-        signals.extend(self._scrape_job_boards())
         logger.info("JobPostingScraper: %d signals", len(signals))
         return signals
-
-    def _scrape_job_boards(self) -> list[SAPSignal]:
-        """Try direct job boards — if they 403, the fetch fallback kicks in
-        and returns Google site-search results for that domain instead."""
-        results = []
-        for country, boards in self.JOB_BOARDS.items():
-            for board_name, url in boards:
-                resp = self.fetch(url)
-                if not resp:
-                    continue
-                soup = BeautifulSoup(resp.text, "lxml")
-                # Generic selectors that work across job boards and Google fallback results
-                for item in soup.select("div.g, div[data-hveid], li.has-pointer-d, .job-item, [data-job-id], article, [class*='job']")[:12]:
-                    title_el = item.select_one("h3, h2 a, .jb-title a, a[class*='title'], a.job-title")
-                    if not title_el:
-                        continue
-                    title = title_el.get_text(strip=True)
-                    if "sap" not in title.lower():
-                        continue
-                    # Try to get company from job board HTML
-                    company_el = item.select_one("[class*='company'], .jb-company, .employer, .org")
-                    if company_el:
-                        company = company_el.get_text(strip=True)
-                    else:
-                        company = self._extract_hiring_company(title, "")
-                    if not company or is_excluded(company):
-                        continue
-                    link = title_el.get("href", "")
-                    results.append(SAPSignal(
-                        company=company,
-                        country=country,
-                        sap_products=self._infer_sap_role(title),
-                        signal_type="job_posting",
-                        signal_quality="Medium",
-                        source_name=board_name,
-                        source_url=link,
-                        summary=f"Hiring: {title[:100]}",
-                    ))
-        return results
 
     def _scrape_google_jobs(self) -> list[SAPSignal]:
         results = []
@@ -777,7 +725,7 @@ class JobPostingScraper(BaseScraper):
                         signal_quality="Medium",
                         source_name="Job Posting",
                         source_url=link,
-                        summary=f"Hiring SAP staff: {title[:100]}",
+                        summary=f"Hiring SAP staff: {title[:150]}",
                     ))
         return results
 
@@ -821,20 +769,26 @@ class JobPostingScraper(BaseScraper):
 # ============================================================================
 
 class ProcurementScraper(BaseScraper):
-    """Searches for government SAP/ERP procurement via Google (more reliable
-    than hitting gov portals directly which often block or require JS)."""
+    """Searches for government SAP/ERP procurement and implementation
+    announcements via Google. Uses broader queries to capture actual results."""
 
     QUERIES = {
         "Saudi Arabia": [
-            'site:etimad.sa SAP OR ERP',
-            '"SAP" tender OR procurement Saudi Arabia government',
+            '"SAP" "Saudi Arabia" government implementation OR deployment OR contract',
+            '"SAP" tender OR procurement "Saudi Arabia" OR "KSA" ministry OR authority',
+            '"SAP S/4HANA" OR "SAP ERP" "Saudi" government OR ministry',
+            '"implements SAP" OR "deploys SAP" OR "awarded SAP" Saudi government',
         ],
         "UAE": [
-            '"SAP" tender OR procurement UAE government Dubai "Abu Dhabi"',
-            'site:dubai.gov.ae SAP OR ERP',
+            '"SAP" government Dubai OR "Abu Dhabi" OR UAE implementation OR contract',
+            '"SAP" tender OR procurement UAE government OR municipality OR authority',
+            '"SAP S/4HANA" OR "SAP ERP" UAE government OR ministry',
+            '"implements SAP" OR "deploys SAP" OR "awarded SAP" UAE Dubai',
         ],
         "Qatar": [
-            '"SAP" tender OR procurement Qatar government',
+            '"SAP" government Qatar implementation OR deployment OR contract',
+            '"SAP" tender OR procurement Qatar ministry OR authority',
+            '"implements SAP" OR "deploys SAP" OR "awarded SAP" Qatar',
         ],
     }
 
@@ -850,39 +804,46 @@ class ProcurementScraper(BaseScraper):
                 for item in soup.select("div.g, div[data-hveid]")[:10]:
                     title_el = item.select_one("h3")
                     link_el = item.select_one("a[href]")
+                    snippet_el = item.select_one("div.VwiC3b, span.st, div[data-sncf]")
                     if not title_el:
                         continue
                     title = title_el.get_text(strip=True)
                     link = link_el.get("href", "") if link_el else ""
-                    combined = title.lower()
+                    snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                    combined = f"{title} {snippet}".lower()
                     if "sap" not in combined and "erp" not in combined:
                         continue
-                    company = self._extract_org(title)
+                    company = self._extract_org(title, snippet)
                     if is_excluded(company):
                         continue
                     signals.append(SAPSignal(
                         company=company,
                         country=country,
-                        sap_products=self._detect_products(title),
+                        sap_products=self._detect_products(f"{title} {snippet}"),
                         industry="Government",
                         signal_type="procurement",
                         signal_quality="Medium",
                         source_name="Procurement",
                         source_url=link,
-                        summary=title[:200],
+                        summary=f"{title[:150]}",
                     ))
         logger.info("ProcurementScraper: %d signals", len(signals))
         return signals
 
-    def _extract_org(self, title: str) -> str:
+    def _extract_org(self, title: str, snippet: str = "") -> str:
+        combined = f"{title} {snippet}"
         patterns = [
+            r"(.+?)\s+(?:implements|deploys|selects|awards|goes live|adopts|migrates to|signs|announces)\s+(?:SAP|ERP)",
             r"^(.+?)\s+(?:tender|procurement|rfp|bid|contract)",
             r"^(.+?)\s+(?:awards|issues|publishes)",
+            r"(?:Ministry of|Department of|Authority of)\s+(.+?)(?:\s+[-–|,.]|\s+(?:implements|deploys))",
         ]
         for pat in patterns:
-            m = re.search(pat, title, re.IGNORECASE)
+            m = re.search(pat, combined, re.IGNORECASE)
             if m:
-                return m.group(1).strip()[:80]
+                name = m.group(1).strip()
+                if len(name) > 3 and not is_excluded(name):
+                    return name[:80]
         return title[:70]
 
 
@@ -891,14 +852,20 @@ class ProcurementScraper(BaseScraper):
 # ============================================================================
 
 class ConferenceScraper(BaseScraper):
-    """Searches for SAP-related conference speakers from GCC events."""
+    """Searches for SAP-related conference speakers and event mentions from GCC."""
 
     def scrape(self) -> list[SAPSignal]:
         signals = []
         queries = [
-            '"SAP" speaker OR agenda LEAP 2025 2026 Saudi',
-            '"SAP" speaker OR agenda GITEX Dubai 2025 2026',
-            '"SAP" speaker OR keynote "Middle East" conference 2025 2026',
+            # Event-specific queries
+            '"SAP" LEAP Riyadh speaker OR customer OR session',
+            '"SAP" GITEX Dubai speaker OR customer OR session',
+            '"SAP Now" OR "SAP Sapphire" Middle East OR Dubai OR Riyadh',
+            # Broader conference mentions
+            '"SAP" conference OR summit "Middle East" OR GCC customer OR speaker OR case study',
+            '"SAP" event Riyadh OR Dubai OR Doha 2024 OR 2025 OR 2026',
+            # SAP-specific partner/customer events
+            '"SAP" "customer success" OR "go-live" OR "digital transformation" GCC OR "Middle East"',
         ]
         for query in queries:
             url = f"https://www.google.com/search?q={quote_plus(query)}&num=10"
@@ -908,25 +875,30 @@ class ConferenceScraper(BaseScraper):
             soup = BeautifulSoup(resp.text, "lxml")
             for item in soup.select("div.g, div[data-hveid]")[:10]:
                 title_el = item.select_one("h3")
-                snippet_el = item.select_one("div.VwiC3b, span.st")
+                link_el = item.select_one("a[href]")
+                snippet_el = item.select_one("div.VwiC3b, span.st, div[data-sncf]")
                 if not title_el:
                     continue
                 title = title_el.get_text(strip=True)
                 snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                link = link_el.get("href", "") if link_el else ""
                 combined = f"{title} {snippet}"
                 if "sap" not in combined.lower():
+                    continue
+                company = self._extract_speaker_org(combined)
+                if is_excluded(company):
                     continue
                 country = self._infer_country(combined)
                 if not country:
                     country = "GCC"
                 signals.append(SAPSignal(
-                    company=self._extract_speaker_org(combined),
+                    company=company,
                     country=country,
                     sap_products=self._detect_products(combined),
                     signal_type="conference",
                     signal_quality="Medium",
-                    source_name="Conference",
-                    source_url=title_el.find_parent("a", href=True).get("href", "") if title_el.find_parent("a", href=True) else "",
+                    source_name="Conference/Event",
+                    source_url=link,
                     summary=title[:200],
                 ))
         logger.info("ConferenceScraper: %d signals", len(signals))
@@ -934,7 +906,9 @@ class ConferenceScraper(BaseScraper):
 
     def _extract_speaker_org(self, text: str) -> str:
         patterns = [
-            r"(?:from|of|at)\s+(.+?)(?:\s*[-–|,.]|\s+(?:speaks|presents|discusses|shares))",
+            r"(?:from|of|at|with)\s+(.+?)(?:\s*[-–|,.]|\s+(?:speaks|presents|discusses|shares|announces|showcases))",
+            r"(.+?)\s+(?:shares|presents|showcases|announces|discusses)\s+.*?SAP",
+            r"(.+?)\s+(?:at|during)\s+(?:LEAP|GITEX|SAP Now|SAP Sapphire)",
         ]
         for pat in patterns:
             m = re.search(pat, text, re.IGNORECASE)
@@ -972,7 +946,8 @@ def normalize_company(name: str) -> str:
 
 
 def deduplicate_signals(signals: list[SAPSignal]) -> list[dict]:
-    """Group signals by company, filter exclusions, compute corroboration scores."""
+    """Group signals by company, filter exclusions, compute corroboration scores.
+    Preserves evidence (URLs, summaries, dates) for board-level presentation."""
     company_map: dict[str, dict] = defaultdict(lambda: {
         "company": "",
         "country": "",
@@ -980,6 +955,7 @@ def deduplicate_signals(signals: list[SAPSignal]) -> list[dict]:
         "industries": set(),
         "signal_types": set(),
         "sources": [],
+        "evidence": [],        # list of {type, source, url, summary, date}
         "signal_count": 0,
         "best_quality": "Low",
     })
@@ -1008,6 +984,14 @@ def deduplicate_signals(signals: list[SAPSignal]) -> list[dict]:
         rec["signal_types"].add(sig.signal_type)
         if sig.source_name and sig.source_name not in rec["sources"]:
             rec["sources"].append(sig.source_name)
+        # Preserve evidence for this signal
+        rec["evidence"].append({
+            "type": sig.signal_type,
+            "source": sig.source_name,
+            "url": sig.source_url,
+            "summary": sig.summary,
+            "date": sig.date_detected,
+        })
         rec["signal_count"] += 1
         if quality_rank.get(sig.signal_quality, 0) > quality_rank.get(rec["best_quality"], 0):
             rec["best_quality"] = sig.signal_quality
@@ -1021,6 +1005,15 @@ def deduplicate_signals(signals: list[SAPSignal]) -> list[dict]:
         rec["industries"] = sorted(rec["industries"])
         rec["signal_types"] = sorted(rec["signal_types"])
         rec["corroboration_score"] = len(rec["signal_types"])
+        # Deduplicate evidence by URL (keep unique entries)
+        seen_urls = set()
+        unique_evidence = []
+        for ev in rec["evidence"]:
+            ev_key = ev["url"] or ev["summary"]
+            if ev_key not in seen_urls:
+                seen_urls.add(ev_key)
+                unique_evidence.append(ev)
+        rec["evidence"] = unique_evidence
         results.append(rec)
 
     results.sort(key=lambda r: (r["corroboration_score"], r["signal_count"]), reverse=True)
@@ -1054,6 +1047,7 @@ class ReportGenerator:
             self._add_company_table(prs, companies, country)
 
         self._add_high_confidence(prs, companies)
+        self._add_evidence_detail(prs, companies)
         self._add_methodology(prs)
 
         base_name = f"SAP_Customer_Intelligence_GCC_{date.today().isoformat()}"
@@ -1224,26 +1218,60 @@ class ReportGenerator:
         if not filtered:
             return
 
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
-        self._add_slide_title(slide, f"SAP Customers — {country}")
+        # Split into pages of 15 rows each to avoid overflow
+        page_size = 15
+        for page_idx in range(0, len(filtered), page_size):
+            page_companies = filtered[page_idx:page_idx + page_size]
+            page_label = f" (page {page_idx // page_size + 1})" if len(filtered) > page_size else ""
 
-        headers = ["Company", "Industry", "SAP Products", "Confidence"]
-        max_rows = min(len(filtered), 20)
-        table = slide.shapes.add_table(max_rows + 1, len(headers), Inches(0.3), Inches(1.4), Inches(12.7), Inches(5.0)).table
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            self._add_slide_title(slide, f"SAP Customers — {country}{page_label}")
 
-        for i, header in enumerate(headers):
-            cell = table.cell(0, i)
-            cell.text = header
-            cell.fill.solid()
-            cell.fill.fore_color.rgb = SAP_BLUE
+            headers = ["Company", "Industry", "SAP Products", "Evidence / Source", "Conf."]
+            max_rows = len(page_companies)
+            table = slide.shapes.add_table(max_rows + 1, len(headers), Inches(0.2), Inches(1.4), Inches(12.9), Inches(5.0)).table
 
-        for i, comp in enumerate(filtered[:max_rows], 1):
-            table.cell(i, 0).text = comp["company"][:40]
-            table.cell(i, 1).text = ", ".join(comp["industries"])[:25] if comp["industries"] else "—"
-            table.cell(i, 2).text = ", ".join(comp["sap_products"][:3])[:50]
-            score = comp["corroboration_score"]
-            conf = "High" if score >= 2 else "Medium" if score == 1 else "Low"
-            table.cell(i, 3).text = conf
+            # Set column widths
+            table.columns[0].width = Inches(2.8)
+            table.columns[1].width = Inches(1.8)
+            table.columns[2].width = Inches(3.0)
+            table.columns[3].width = Inches(4.3)
+            table.columns[4].width = Inches(1.0)
+
+            for i, header in enumerate(headers):
+                cell = table.cell(0, i)
+                cell.text = header
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = SAP_BLUE
+                for paragraph in cell.text_frame.paragraphs:
+                    paragraph.font.color.rgb = WHITE
+                    paragraph.font.size = Pt(10)
+                    paragraph.font.bold = True
+
+            for i, comp in enumerate(page_companies, 1):
+                table.cell(i, 0).text = comp["company"][:40]
+                table.cell(i, 1).text = ", ".join(comp["industries"])[:25] if comp["industries"] else "—"
+                table.cell(i, 2).text = ", ".join(comp["sap_products"][:3])[:50]
+                # Evidence column: show top evidence summary
+                evidence_parts = []
+                for ev in comp.get("evidence", [])[:2]:
+                    src = ev.get("source", "")
+                    summary = ev.get("summary", "")
+                    if summary:
+                        evidence_parts.append(f"[{src}] {summary[:60]}")
+                    elif src:
+                        evidence_parts.append(src)
+                table.cell(i, 3).text = " | ".join(evidence_parts)[:100] if evidence_parts else ", ".join(comp["sources"][:2])
+                score = comp["corroboration_score"]
+                conf = "High" if score >= 2 else "Med" if score == 1 else "Low"
+                table.cell(i, 4).text = conf
+
+                # Style cells
+                for col in range(len(headers)):
+                    cell = table.cell(i, col)
+                    for paragraph in cell.text_frame.paragraphs:
+                        paragraph.font.size = Pt(8)
+                        paragraph.font.color.rgb = SAP_DARK
 
     def _add_high_confidence(self, prs, companies):
         high_conf = [c for c in companies if c["corroboration_score"] >= 2]
@@ -1253,22 +1281,106 @@ class ReportGenerator:
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         self._add_slide_title(slide, "High-Confidence Targets (2+ Source Types)")
 
-        headers = ["Company", "Country", "Industry", "SAP Products", "Sources"]
-        rows = min(len(high_conf), 18) + 1
-        table = slide.shapes.add_table(rows, len(headers), Inches(0.3), Inches(1.4), Inches(12.7), Inches(5.0)).table
+        headers = ["Company", "Country", "SAP Products", "Sources", "Key Evidence"]
+        rows = min(len(high_conf), 15) + 1
+        table = slide.shapes.add_table(rows, len(headers), Inches(0.2), Inches(1.4), Inches(12.9), Inches(5.0)).table
+
+        table.columns[0].width = Inches(2.5)
+        table.columns[1].width = Inches(1.2)
+        table.columns[2].width = Inches(2.8)
+        table.columns[3].width = Inches(2.0)
+        table.columns[4].width = Inches(4.4)
 
         for i, header in enumerate(headers):
             cell = table.cell(0, i)
             cell.text = header
             cell.fill.solid()
             cell.fill.fore_color.rgb = SAP_BLUE
+            for paragraph in cell.text_frame.paragraphs:
+                paragraph.font.color.rgb = WHITE
+                paragraph.font.size = Pt(10)
+                paragraph.font.bold = True
 
-        for i, comp in enumerate(high_conf[:18], 1):
+        for i, comp in enumerate(high_conf[:15], 1):
             table.cell(i, 0).text = comp["company"][:35]
             table.cell(i, 1).text = comp["country"]
-            table.cell(i, 2).text = ", ".join(comp["industries"])[:20] if comp["industries"] else "—"
-            table.cell(i, 3).text = ", ".join(comp["sap_products"][:2])[:40]
-            table.cell(i, 4).text = ", ".join(comp["sources"][:3])[:40]
+            table.cell(i, 2).text = ", ".join(comp["sap_products"][:3])[:45]
+            table.cell(i, 3).text = ", ".join(comp["sources"][:3])[:30]
+            # Show best evidence summary
+            best_ev = ""
+            for ev in comp.get("evidence", []):
+                if ev.get("summary"):
+                    best_ev = ev["summary"][:80]
+                    break
+            table.cell(i, 4).text = best_ev or "—"
+
+            for col in range(len(headers)):
+                cell = table.cell(i, col)
+                for paragraph in cell.text_frame.paragraphs:
+                    paragraph.font.size = Pt(8)
+                    paragraph.font.color.rgb = SAP_DARK
+
+    def _add_evidence_detail(self, prs, companies):
+        """Add detailed evidence slides showing references per company.
+        Board-ready: each company shows its sources, URLs, and evidence summaries."""
+        # Only include companies that have evidence beyond just seed data
+        companies_with_evidence = [
+            c for c in companies
+            if any(ev.get("url") or ev.get("summary") for ev in c.get("evidence", []))
+        ]
+        if not companies_with_evidence:
+            return
+
+        # Page through companies, ~6 per slide
+        page_size = 6
+        for page_idx in range(0, min(len(companies_with_evidence), 30), page_size):
+            page = companies_with_evidence[page_idx:page_idx + page_size]
+            page_num = page_idx // page_size + 1
+
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            self._add_slide_title(slide, f"Evidence & References (page {page_num})")
+
+            y_pos = 1.4
+            for comp in page:
+                # Company header
+                txBox = slide.shapes.add_textbox(Inches(0.4), Inches(y_pos), Inches(12.5), Inches(0.3))
+                tf = txBox.text_frame
+                tf.word_wrap = True
+                p = tf.paragraphs[0]
+                p.text = f"{comp['company']} ({comp['country']}) — {', '.join(comp['sap_products'][:3])}"
+                p.font.size = Pt(11)
+                p.font.bold = True
+                p.font.color.rgb = SAP_BLUE
+
+                # Evidence bullets
+                y_pos += 0.3
+                ev_box = slide.shapes.add_textbox(Inches(0.6), Inches(y_pos), Inches(12.3), Inches(0.6))
+                ev_tf = ev_box.text_frame
+                ev_tf.word_wrap = True
+
+                evidence_lines = []
+                for ev in comp.get("evidence", [])[:3]:
+                    parts = []
+                    if ev.get("source"):
+                        parts.append(f"[{ev['source']}]")
+                    if ev.get("summary"):
+                        parts.append(ev["summary"][:100])
+                    if ev.get("url") and ev["url"].startswith("http"):
+                        parts.append(f"({ev['url'][:80]})")
+                    if parts:
+                        evidence_lines.append(" ".join(parts))
+
+                if not evidence_lines:
+                    evidence_lines = [", ".join(comp.get("sources", ["—"]))]
+
+                for line in evidence_lines:
+                    ep = ev_tf.add_paragraph()
+                    ep.text = f"  {line}"
+                    ep.font.size = Pt(8)
+                    ep.font.color.rgb = GRAY
+                    ep.space_after = Pt(2)
+
+                y_pos += 0.55 + len(evidence_lines) * 0.12
 
     def _add_methodology(self, prs):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
