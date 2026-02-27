@@ -1,0 +1,6 @@
+*.pptx
+*.tar.gz
+sap-intel-agent/
+__pycache__/
+*.pyc
+.env
